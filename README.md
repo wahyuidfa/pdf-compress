@@ -1,0 +1,2 @@
+# pdf-compress
+compress pdf
