@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <script defer src="/_vercel/insights/script.js"></script>
+    <title>PDF Compressor 800KB (Fixed)</title>
+    <style>
+        .progress-container {
+            width: 100%;
+            height: 20px;
+            background-color: #f1f1f1;
+            display: none;
+            position: absolute;
+            bottom: 10px;
+        }
+        .progress-bar {
+            width: 0%;
+            height: 100%;
+            background-color: #4CAF50;
+            transition: width 0.3s ease;
+        }
+    </style>
+    <script src="https://cdn.tailwindcss.com">
+    </script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css" rel="stylesheet"/>
+</head>
+<body class="flex items-center justify-center min-h-screen bg-gray-100">
+    <div class="text-center">
+     <h1 class="text-2xl font-bold mb-4">
+      Compress
+      <span class="text-blue-500">
+       Your
+      </span>
+      PDF
+      <span class="text-blue-500">
+       To
+      </span>
+      Smaller Size
+     </h1>
+     <div class="border-2 border-dashed border-blue-300 p-8 rounded-lg bg-white">
+      <img alt="PDF icon" class="mx-auto mb-4" height="100" src="https://storage.googleapis.com/a1aa/image/iO4r7vXuZYAx49L6MyHe8DDxZ-mNOigBji1adcAOjAE.jpg" width="100"/>
+      <input type="file" id="pdfInput" accept="application/pdf" class="bg-blue-500 text-white px-4 py-2 rounded mb-2">
+     </input>
+      <p class="text-gray-500">
+       Or drop file here
+      </p>
+     </div>
+     
+    </div>
+    <div class="progress-container">
+        <div class="progress-bar"></div>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.6.347/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <script>
+        const PDFJS = pdfjsLib;
+        const jsPDF = window.jspdf.jsPDF;
+        let worker = null;
+
+        document.getElementById('pdfInput').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            showProgress();
+            try {
+                const pdfData = await readFile(file);
+                await compressPDF(pdfData, file.name);
+            } catch (err) {
+                console.error(err);
+                alert('Error processing file: ' + err.message);
+            } finally {
+                hideProgress();
+            }
+        });
+
+        async function readFile(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(new Uint8Array(e.target.result));
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        async function compressPDF(pdfData, filename) {
+            const config = {
+                targetSize: 1000000, // 900KB
+                maxAttempts: 10,   // Maksimal 10 percobaan
+                initialQuality: 0.99, // Naikkan kualitas awal
+                scaleStep: 0.99,     // Lebih presisi dalam scaling
+                minQuality: 1,     // Batas minimum kualitas lebih tinggi
+                minScale: 1 
+            };
+
+            const loadingTask = PDFJS.getDocument({data: pdfData});
+            const pdf = await loadingTask.promise;
+            const totalPages = pdf.numPages;
+            
+            // Inisialisasi Web Worker
+            worker = new Worker(URL.createObjectURL(new Blob([`
+                self.onmessage = async (e) => {
+                    const {imageBitmap, quality} = e.data;
+                    const canvas = new OffscreenCanvas(imageBitmap.width, imageBitmap.height);
+                    const ctx = canvas.getContext('2d');
+                    
+                    // Gambar ke canvas
+                    ctx.drawImage(imageBitmap, 0, 0);
+                    
+                    // Kompresi gambar
+                    const blob = await canvas.convertToBlob({
+                        type: 'image/jpeg',
+                        quality: quality
+                    });
+                    
+                    postMessage(blob);
+                };
+            `], {type: 'application/javascript'})));
+
+            let optimized = false;
+            let currentQuality = config.initialQuality;
+            let currentScale = 0.9;
+
+            for (let attempt = 0; attempt < config.maxAttempts; attempt++) {
+                const doc = new jsPDF();
+                let totalSize = 0;
+                
+                for (let i = 1; i <= totalPages; i++) {
+                    updateProgress(i, totalPages, attempt+1, config.maxAttempts);
+                    const page = await pdf.getPage(i);
+                    const viewport = page.getViewport({scale: 1});
+                    
+                    // Render ke canvas utama
+                    const canvas = document.createElement('canvas');
+                    canvas.width = viewport.width * currentScale;
+                    canvas.height = viewport.height * currentScale;
+                    
+                    const renderContext = {
+                        canvasContext: canvas.getContext('2d'),
+                        viewport: page.getViewport({scale: currentScale})
+                    };
+                    
+                    await page.render(renderContext).promise;
+                    
+                    // Konversi ke ImageBitmap dan transfer ke worker
+                    const imageBitmap = await createImageBitmap(canvas);
+                    const blob = await processWithWorker(imageBitmap, currentQuality);
+                    const imgData = URL.createObjectURL(blob);
+                    
+                    if (i > 1) doc.addPage();
+                    doc.addImage(imgData, 'JPEG', 10, 10, 
+                        doc.internal.pageSize.width - 20, 
+                        doc.internal.pageSize.height - 20);
+                    
+                    // Cek ukuran sementara
+                    const tempSize = doc.output('blob').size;
+                    if (tempSize > config.targetSize * 1.5) {
+                        currentQuality = Math.max(config.minQuality, currentQuality - 0.05);
+                        currentScale = Math.max(config.minScale, currentScale - config.scaleStep);
+                        break;
+                    }
+                }
+                
+                const finalBlob = doc.output('blob');
+                totalSize = finalBlob.size;
+                
+                if (totalSize <= config.targetSize) {
+                    saveFile(finalBlob, filename);
+                    optimized = true;
+                    break;
+                }
+                
+                // Penyesuaian parameter
+                currentQuality = Math.max(config.minQuality, currentQuality - 0.05);
+                currentScale = Math.max(config.minScale, currentScale - config.scaleStep);
+            }
+
+            worker.terminate();
+            if (!optimized) alert('Kompresi mencapai batas minimum sebelum mencapai 800KB');
+        }
+
+        async function processWithWorker(imageBitmap, quality) {
+            return new Promise((resolve) => {
+                worker.onmessage = (e) => resolve(e.data);
+                worker.postMessage({imageBitmap, quality}, [imageBitmap]);
+            });
+        }
+
+        function saveFile(blob, filename) {
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = 'compressed_800KB_' + filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function showProgress() {
+            document.querySelector('.progress-container').style.display = 'block';
+        }
+
+        function hideProgress() {
+            document.querySelector('.progress-container').style.display = 'none';
+        }
+
+        function updateProgress(currentPage, totalPages, currentAttempt, maxAttempts) {
+            const pageProgress = (currentPage / totalPages) * 100;
+            const attemptProgress = (currentAttempt / maxAttempts) * 25;
+            const totalProgress = pageProgress * 0.75 + attemptProgress;
+            document.querySelector('.progress-bar').style.width = totalProgress + '%';
+        }
+    </script>
+   </body>
+
+</html>
